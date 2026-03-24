@@ -2,10 +2,33 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import io
 from gensim.models import KeyedVectors
 from pathlib import Path
 
+
 st.set_page_config(page_title="Bio-Psych Analyzer", layout="wide")
+
+# --- GENERACION DEL EXCEL MULTISOLAPA ---
+def create_master_xlsx(df_full, df_vec, df_troyer, group_col, col_name):
+    output = io.BytesIO()
+    
+    # Determinar columnas para la hoja de Resumen
+    cols_res = [col_name, col_sim, col_cat] # En lugar de nombres fijos entre comillas
+    if group_col != "(Ninguno)":
+        cols_res = [group_col] + cols_res
+        
+    # Seleccionamos solo las que existen para evitar errores
+    df_resumen = df_full[cols_res]
+    
+    # Cambiamos engine='xlsxwriter' por engine='openpyxl'
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_full.to_excel(writer, sheet_name='1_Resultados_Completos', index=False)
+        df_resumen.to_excel(writer, sheet_name='2_Resumen_Semantico', index=False)
+        df_vec.to_excel(writer, sheet_name='3_Lista_Vectores', index=False)
+        df_troyer.to_excel(writer, sheet_name='4_Diccionario_Troyer', index=False)
+    
+    return output.getvalue()
 
 # --- DEFINIR RUTA BASE ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -122,13 +145,14 @@ with col2:
 st.sidebar.markdown("---")
 
 # --- UI: CARGA DE ARCHIVO ---
-uploaded_file = st.file_uploader("Carga tu archivo CSV o Excel", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Carga tus datos de sujetos (CSV, XLSX)", type=["csv", "xlsx"])
 
 if uploaded_file:
-
-    # Leer archivo según tipo
+    # Si es Excel, seleccionamos la hoja
     if uploaded_file.name.endswith(".xlsx"):
-        df = pd.read_excel(uploaded_file)
+        xl_data = pd.ExcelFile(uploaded_file)
+        hoja_datos = st.selectbox("Selecciona la hoja donde están las respuestas:", xl_data.sheet_names)
+        df = pd.read_excel(uploaded_file, sheet_name=hoja_datos)
     else:
         df = pd.read_csv(uploaded_file)
 
@@ -174,99 +198,114 @@ if uploaded_file:
             grupos = [None] * len(palabras_originales)
             use_group = False
 
-        resultados = []
+        # Creamos copia para mantener todas las columnas originales y añadimos las nuevas
+        res_df = df.copy()
+        # Definimos los nombres "estándar" que buscamos
+        nombre_sim_estandar = "similitud_w2vec_coseno"
+        nombre_cat_estandar = "categoria_troyer"
+
+        # Función para buscar columna ignorando mayúsculas
+        def encontrar_columna(df, nombre_buscado):
+            for c in df.columns:
+                if str(c).lower().strip() == nombre_buscado.lower():
+                    return c
+            return None
+
+        # Buscamos si ya existen en el Excel del cliente
+        col_sim = encontrar_columna(res_df, nombre_sim_estandar)
+        col_cat = encontrar_columna(res_df, nombre_cat_estandar)
+
+        # Si no existen, las creamos al final
+        if col_sim is None:
+            col_sim = nombre_sim_estandar
+            res_df[col_sim] = None
+        
+        if col_cat is None:
+            col_cat = nombre_cat_estandar
+            res_df[col_cat] = None
         vectores_lista = []
+        #resultados = []
+        
 
-        for i, p in enumerate(palabras_clean):
+        for i, p_clean in enumerate(palabras_clean):
+            # Asignar Categoría usando el nombre detectado o creado
+            res_df.at[i, col_cat] = st.session_state.troyer.get(p_clean, "Otros / No definido")
 
-            p_clean = p.lower().strip()
-
-            row = {
-                "Orden": i + 1,
-                "Palabra": p_clean
-            }
-
-            # --- Categoria Troyer (usar diccionario en session_state) ---
-            row["Categoria_Troyer"] = st.session_state.troyer.get(
-                p_clean,
-                "Otros / No definido"
-            )
-
-            # --- Word2Vec ---
             if p_clean in modelo:
-
                 vec = modelo[p_clean]
+                vectores_lista.append([p_clean] + vec.tolist())
 
-                # Determinar similitud: NULL si es primera fila del dataset
-                # o si cambiamos de sujeto (cuando se eligió columna de grupo)
-                if i == 0:
-                    sim = None
-                elif use_group and (grupos[i] != grupos[i - 1]):
+                if i == 0 or (use_group and grupos[i] != grupos[i-1]):
                     sim = None
                 else:
-                    prev = palabras_clean[i - 1].lower().strip()
-                    if prev in modelo:
-                        sim = float(modelo.similarity(prev, p_clean))
-                    else:
-                        sim = None
-
-                row["Similitud_Coseno"] = sim
-
-                vectores_lista.append(
-                    [p_clean] + vec.tolist()
-                )
-
+                    prev = palabras_clean[i-1]
+                    sim = float(modelo.similarity(prev, p_clean)) if prev in modelo else None
+                
+                res_df.at[i, col_sim] = float(sim) if sim is not None else None
             else:
-                row["Similitud_Coseno"] = None
+                res_df.at[i, col_sim] = None
 
-            resultados.append(row)
-
-        res_df = pd.DataFrame(resultados)
+        # (Elimina la línea 'res_df = pd.DataFrame(resultados)' que tenías después del bucle)
+        #res_df = pd.DataFrame(resultados)
 
         # --- VISUALIZACIÓN ---
-        st.subheader("Gráfico de Similitud Semántica")
+        st.subheader("📊 Análisis Comparativo de Trayectorias")
 
+        # 1. Crear una columna de posición relativa (para que todos empiecen en 0 en el eje X)
+        if group_col != "(Ninguno)":
+            # Esto hace que cada sujeto tenga su propio conteo 0, 1, 2, 3...
+            res_df["Posicion_Sujeto"] = res_df.groupby(group_col).cumcount()
+            eje_x = "Posicion_Sujeto"
+            color_param = group_col  # El color cambiará según el ID del sujeto
+        else:
+            res_df["Posicion_Sujeto"] = res_df.index
+            eje_x = "Posicion_Sujeto"
+            color_param = None
+
+        # 2. Crear el gráfico interactivo
         fig = px.line(
             res_df,
-            x="Orden",
-            y="Similitud_Coseno",
-            hover_name="Palabra",
-            markers=True
+            x=eje_x,
+            y=col_sim,
+            color=color_param,  # Esto crea la leyenda y permite "apagar" sujetos
+            hover_name=col_name,
+            markers=True,
+            title="Comparación de Similitud Semántica entre Sujetos",
+            labels={
+                eje_x: "Orden de la palabra producida",
+                col_sim: "Similitud Coseno (W2Vec)",
+                group_col: "ID Sujeto"
+            },
+            template="plotly_white" # Un estilo más limpio/académico
+        )
+
+        # 3. Ajustes finos de interactividad
+        fig.update_layout(
+            legend_title_text='Haga clic para ocultar:',
+            hovermode="x unified" # Muestra todas las similitudes de los sujetos al mismo tiempo en esa posición
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # Mostrar tabla de resultados
-        st.subheader("Resultados")
-        st.dataframe(res_df)
-
         # --- DESCARGAS ---
+        st.subheader("📥 Descargar Reportes")
+        
+        # Preparar tablas adicionales
+        vec_df = pd.DataFrame(vectores_lista, columns=["Palabra"] + [f"Dim_{i}" for i in range(300)])
+        troyer_ref = pd.DataFrame(list(st.session_state.troyer.items()), columns=["Palabra", "Categoria"])
+
+        # Botón para Excel Maestro
+        excel_data = create_master_xlsx(res_df, vec_df, troyer_ref, group_col, col_name)
+        st.download_button(
+            "🌟 Descargar Reporte Excel Completo (4 solapas)",
+            data=excel_data,
+            file_name="SemanticFlow_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # Botones individuales (CSV/TSV)
         col1, col2 = st.columns(2)
-
         with col1:
-            csv_sim = res_df.to_csv(index=False).encode("utf-8")
-
-            st.download_button(
-                "Descargar Resultados (CSV)",
-                csv_sim,
-                "resultados.csv",
-                "text/csv"
-            )
-
+            st.download_button("Resultados (CSV)", res_df.to_csv(index=False).encode("utf-8"), "resultados.csv", "text/csv")
         with col2:
-
-            if vectores_lista:
-
-                vec_df = pd.DataFrame(
-                    vectores_lista,
-                    columns=["Palabra"] + [f"Dim_{i}" for i in range(300)]
-                )
-
-                csv_vec = vec_df.to_csv(index=False).encode("utf-8")
-
-                st.download_button(
-                    "Descargar Lista de Vectores (CSV)",
-                    csv_vec,
-                    "vectores.csv",
-                    "text/csv"
-                )
+            st.download_button("Vectores (TSV)", vec_df.to_csv(sep='\t', index=False).encode("utf-8"), "vectores.tsv", "text/tab-separated-values")
