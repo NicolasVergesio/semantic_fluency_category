@@ -9,7 +9,7 @@ st.set_page_config(page_title="Bio-Psych Analyzer", layout="wide")
 
 # --- DEFINIR RUTA BASE ---
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR.parent / "SBW-vectors-300-min5.bin.gz"
+MODEL_PATH = BASE_DIR.parent / "data" / "SBW-vectors-300-min5.bin.gz"
 
 # --- CARGA DEL MODELO (CACHE) ---
 @st.cache_resource
